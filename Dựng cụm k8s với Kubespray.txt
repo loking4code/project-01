@@ -1,0 +1,218 @@
+==== KUBESPRAY - HA K8S CLUSTER =====
+
+Mô hình: 
+3 master , 1 worker
+Bootstrap được cài luôn trên master-node-1
+
+----------------- Cài đặt môi trường (ALL NODE) -----------------
+
+hostnamectl set-hostname k8s-master01
+
+apt install -y vim
+vim /etc/ssh/sshd_config ## Change PermitRootLogin -> yes
+systemctl restart sshd
+
+timedatectl set-timezone Asia/Ho_Chi_Minh
+
+cat << EOF >> /etc/hosts
+192.168.10.101 k8s-master01
+192.168.10.102 k8s-master02
+192.168.10.103 k8s-master03
+192.168.10.111 k8s-worker01
+EOF
+
+apt-get update
+apt-get install sudo -y
+apt-get install socat conntrack ipset ipvsadm -y
+apt-get install -y build-essential libssl-dev libffi-dev python-dev
+
+modprobe br_netfilter
+modprobe nf_conntrack
+
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
+net.ipv4.ip_forward=1
+net.ipv4.ip_local_reserved_ports=30000-32767
+net.bridge.bridge-nf-call-iptables=1
+net.bridge.bridge-nf-call-arptables=1
+net.bridge.bridge-nf-call-ip6tables=1
+EOF
+
+sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+swapoff -a
+sh -c "echo '1' > /proc/sys/net/bridge/bridge-nf-call-iptables"
+sh -c "echo '1' > /proc/sys/net/ipv4/ip_forward"
+sysctl --system
+
+----------------- Cài đặt trên Các BOOSTRAP NODE(MASTER 1) -----------------
+ssh-keygen
+ssh-copy-id k8s-master01 ## Thực hiện trên con boostrap
+
+----------------- Cài đặt HAPROXY, KEEPALIVED -----------------
+
+apt install -y haproxy keepalived
+
+vim /etc/haproxy/haproxy.cfg
+ 
+########################### haproxy.cfg ###########################
+
+global
+
+    log         127.0.0.1 local2
+
+    chroot      /var/lib/haproxy
+    pidfile     /var/run/haproxy.pid
+    maxconn     4000
+    user        haproxy
+    group       haproxy
+    daemon
+
+    # turn on stats unix socket
+    stats socket /var/lib/haproxy/stats
+#---------------------------------------------------------------------
+# common defaults that all the 'listen' and 'backend' sections will
+# use if not designated in their block
+#---------------------------------------------------------------------
+defaults
+    mode                    http
+    log                     global
+    option                  httplog
+    option                  dontlognull
+    option http-server-close
+    option forwardfor       except 127.0.0.0/8
+    option                  redispatch
+    retries                 3
+    timeout http-request    10s
+    timeout queue           1m
+    timeout connect         10s
+    timeout client          1m
+    timeout server          1m
+    timeout http-keep-alive 10s
+    timeout check           10s
+    maxconn                 3000
+#---------------------------------------------------------------------
+# apiserver frontend which proxys to the masters
+#---------------------------------------------------------------------
+frontend apiserver
+    bind *:8443
+    mode tcp
+    option tcplog
+    default_backend apiserver
+#---------------------------------------------------------------------
+# round robin balancing for apiserver
+#---------------------------------------------------------------------
+backend apiserver
+
+option httpchk GET /healthz
+    http-check expect status 200
+    mode tcp
+    option ssl-hello-chk
+    balance     roundrobin
+        server k8s-master01 192.168.10.101:6443 check
+        server k8s-master02 192.168.10.102:6443 check
+        server k8s-master03 192.168.10.103:6443 check
+
+######################################################
+
+vim /etc/keepalived/keepalived.conf
+
+########################### keepalived.conf - MASTER ###########################
+
+vrrp_script chk_haproxy {
+  script "killall -0 haproxy"
+  interval 2
+  weight 2
+}
+ 
+vrrp_instance VI_1 {
+  interface eth0
+  state MASTER
+  advert_int 1
+  virtual_router_id 50
+  priority 100
+  unicast_src_ip 192.168.10.101
+  unicast_peer {
+                192.168.10.102
+                192.168.10.103
+  }
+  virtual_ipaddress {
+     192.168.10.100      dev     eth0
+  }
+  track_script {
+    chk_haproxy
+  }
+}
+
+######################################################
+
+########################### keepalived.conf - BACKUP ###########################
+vrrp_script chk_haproxy {
+  script "killall -0 haproxy"
+  interval 2
+  weight 2
+}
+ 
+vrrp_instance VI_1 {
+  interface eth0
+  state BACKUP
+  advert_int 1
+  virtual_router_id 50
+  priority 99
+    unicast_src_ip 192.168.10.102
+  unicast_peer {
+                192.168.10.101
+                192.168.10.103
+  }
+  virtual_ipaddress {
+     192.168.10.100     dev     eth0
+  }
+  track_script {
+    chk_haproxy
+  }
+}
+######################################################
+
+systemctl restart haproxy keepalived
+systemctl enable haproxy keepalived
+
+
+--------------------------- Cài đặt K8s Cluster(BOOSTRAP NODE) ---------------------
+
+apt-get install python3 python3-pip -y
+
+-----Cài đặt python3.10 & pip
+add-apt-repository ppa:deadsnakes/ppa -y
+apt install python3.10 -y
+curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
+
+----Tạo biến môi trường----
+VENVDIR=kubespray-venv
+KUBESPRAYDIR=kubespray
+python3.10 -m venv $VENVDIR
+source $VENVDIR/bin/activate
+cd $KUBESPRAYDIR
+pip install -U -r requirements.txt
+
+vim inventory/production/inventory.ini --> Thay đổi thông tin các Node
+vim /inventory/production/group_var/all/all.yml --> thay đổi lại VIP
+
+ansible-playbook -i inventory/production/inventory.ini --become --become-user=root cluster.yml > log.k8s 2>&1 &
+
+--------------------------- Join thêm Node (Không thay đổi cấu hình các Node cũ) ---------------------
+
+ansible-playbook -i inventory/production/inventory.ini --become --become-user=root cluster.yml --limit=master2,master3 -e ignore_assert_errors=yes > 1.log.k8s 2>&1 &
+
+======Add Worker Node======
+ansible-playbook -i inventory/production/new_inventory.ini --become --become-user=root --limit=node01,node02 facts.yml
+
+ansible-playbook -i inventory/production/new_inventory.ini --become --become-user=root --limit=node01,node02 scale.yml -e ignore_assert_errors=yes > 1.log.k8s 2>&1 &
+
+======Remove node======
+
+1. Chạy lệnh remove node
+
+ansible-playbook -i inventory/production/inventory.ini --become --become-user=root remove-node.yml -e node=node04 -e reset_nodes=false -e allow_ungraceful_removal=true
+
+2. Remove node trong file inventory
+
+=====FIX lỗi khi build lại =====
+# xoá thư mục /var/lib/kubelet/ trên mỗi node

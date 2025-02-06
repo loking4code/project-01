@@ -1,0 +1,24 @@
+nano /etc/hosts
+172.16.2.194 haproxy-01
+172.16.2.107 control-deploy
+172.16.2.246 worker-node-1
+172.16.2.5 master-node-1
+172.16.2.6 master-node-2
+172.16.2.7 master-node-3
+alias ssh='ssh -i id_rsa_k8s'
+
+
+
+master-node-1  ansible_host=172.16.2.5    ip=172.16.2.5
+master-node-2 ansible_host=172.16.2.6     ip=172.16.2.6
+master-node-3  ansible_host=172.16.2.7     ip=172.16.2.7
+worker-node-1  ansible_host=172.16.2.246     ip=172.16.2.246
+
+
+docker run --rm -it --mount type=bind,source=/kubespray/inventory/cluster1,dst=/cluster1 \
+ --mount type=bind,source=/root/.ssh/id_rsa_k8s,dst=/root/.ssh/id_rsa_k8s \
+  quay.io/kubespray/kubespray:v2.25.1 bash 
+
+
+
+ansible-playbook -i inventory/cluster1/hosts.ini -u root -b -v --private-key=~/.ssh/id_rsa_k8s cluster.yml -e ansible_python_interpreter=/usr/bin/python3
